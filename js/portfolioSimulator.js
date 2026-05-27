@@ -1,36 +1,55 @@
 /**
- * Strategy Validation Lab — Trading Portfolio & Transaction Simulator
+ * Strategy Validation Lab — Institutional Alpha Engine & Portfolio Simulator
  * 
- * Tracks simulated capital balances, position states, margins, and enforces
- * strict model governance: one active position, score-filters >= 85, state machines,
- * daily drawdown shutdowns, consecutive losses circuit breakers, and cooldowns.
+ * Production-grade pipeline:
+ *   Data Ingestion → Feature Engineering → Signal Generation → Risk Management → Execution
+ *
+ * Integrates:
+ *   - MicrostructureEngine: OFI, Kyle's Lambda, Amihud, Garman-Klass, Roll Spread
+ *   - SignalModels: TFT (quantile), DLOB (L2 book), HMM (regime), RL (execution)
+ *   - RiskEngine: Fractional Kelly, CVaR 99%, Almgren-Chriss, Drawdown breakers
+ *   - BacktestStats: Walk-forward, Monte Carlo, Deflated Sharpe, SHAP importance
+ *
+ * Governance: One active position, sequential execution, cooldowns, circuit breakers.
  */
 (function () {
   'use strict';
 
+  // ═══════════════════════════════════════════════════════════════
+  //  PORTFOLIO STATE
+  // ═══════════════════════════════════════════════════════════════
   var portfolio = {
     startingCapital: 500000,
     cash: 500000,
     portfolioValue: 500000,
-    riskPerTrade: 0.005, // 0.5% (Strict Institutional Default)
-    mode: 'Balanced', // Conservative, Balanced, Aggressive
+    riskPerTrade: 0.005,
+    mode: 'Balanced',
     useBrokerage: true,
     allowShort: true,
     useMargin: true,
-    positions: {}, // Ticker -> Active Position details
+    positions: {},
     closedTrades: [],
     brokerageFees: 0,
     taxFees: 0,
     slippageFees: 0,
 
-    // --- Institutional Governance State ---
-    currentState: 'WAIT', // WAIT, SCAN, QUALIFY, ENTER, MANAGE, EXIT, COOLDOWN, SHUTDOWN
+    // Governance State
+    currentState: 'WAIT',
     cooldownBarsRemaining: 0,
     consecutiveLosses: 0,
     sessionTradesExecuted: 0,
-    dailyLossCutoff: -0.02, // -2.0% Daily Loss Limit
+    dailyLossCutoff: -0.02,
     isShutdown: false,
-    patienceSkips: 0 // Track skipped setups for patience score
+    patienceSkips: 0,
+
+    // Institutional Alpha Telemetry
+    equityCurve: [],
+    featureVectors: [],
+    signalHistory: [],
+    riskCheckHistory: [],
+    modelContributions: [],
+    barReturns: [],
+    lastPortfolioValue: 500000
   };
 
   function initPortfolio(capital, riskPct, mode, useBrokerage, allowShort, useMargin) {
@@ -48,17 +67,26 @@
     portfolio.taxFees = 0;
     portfolio.slippageFees = 0;
 
-    // Reset Governance State
     portfolio.currentState = 'WAIT';
     portfolio.cooldownBarsRemaining = 0;
     portfolio.consecutiveLosses = 0;
     portfolio.sessionTradesExecuted = 0;
     portfolio.isShutdown = false;
     portfolio.patienceSkips = 0;
+
+    portfolio.equityCurve = [capital];
+    portfolio.featureVectors = [];
+    portfolio.signalHistory = [];
+    portfolio.riskCheckHistory = [];
+    portfolio.modelContributions = [];
+    portfolio.barReturns = [];
+    portfolio.lastPortfolioValue = capital;
   }
 
-  // --- Technical Indicators Helpers ---
-  
+  // ═══════════════════════════════════════════════════════════════
+  //  TECHNICAL INDICATORS (Core — always available)
+  // ═══════════════════════════════════════════════════════════════
+
   function calculateEma(candles, period) {
     var k = 2 / (period + 1);
     if (candles.length === 0) return 0;
@@ -100,8 +128,6 @@
     var ema12 = calculateEma(candles, 12);
     var ema26 = calculateEma(candles, 26);
     var macd = ema12 - ema26;
-    
-    // We compute MACD values for the last 9 candles to get smoothed signal
     var macdValues = [];
     var limit = Math.max(26, candles.length - 12);
     for (var i = limit; i < candles.length; i++) {
@@ -110,13 +136,11 @@
       var e26 = calculateEma(subList, 26);
       macdValues.push(e12 - e26);
     }
-    
     var k = 2 / (9 + 1);
     var signal = macdValues[0] || 0;
     for (var j = 1; j < macdValues.length; j++) {
       signal = macdValues[j] * k + signal * (1 - k);
     }
-    
     return { macd: macd, signal: signal, bullish: macd > signal };
   }
 
@@ -135,8 +159,8 @@
     var sum = 0;
     for (var j = 0; j < period; j++) sum += trs[j];
     var atr = sum / period;
-    for (var k = period; k < trs.length; k++) {
-      atr = (atr * (period - 1) + trs[k]) / period;
+    for (var m = period; m < trs.length; m++) {
+      atr = (atr * (period - 1) + trs[m]) / period;
     }
     return atr;
   }
@@ -168,7 +192,6 @@
       var p = candles[i - 1];
       var tr = Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close));
       trs.push(tr);
-      
       var diffH = c.high - p.high;
       var diffL = p.low - c.low;
       var pdm = (diffH > diffL && diffH > 0) ? diffH : 0;
@@ -186,15 +209,15 @@
       smoothNdm = smoothNdm - (smoothNdm / period) + ndms[j];
       var diPlus = smoothTr > 0 ? (smoothPdm / smoothTr) * 100 : 0;
       var diMinus = smoothTr > 0 ? (smoothNdm / smoothTr) * 100 : 0;
-      var diff = Math.abs(diPlus - diMinus);
-      var sum = diPlus + diMinus;
-      var dx = sum > 0 ? (diff / sum) * 100 : 0;
+      var diff2 = Math.abs(diPlus - diMinus);
+      var sumDi = diPlus + diMinus;
+      var dx = sumDi > 0 ? (diff2 / sumDi) * 100 : 0;
       dxValues.push(dx);
     }
     if (dxValues.length === 0) return 22;
     var adx = dxValues.slice(0, period).reduce(function(a,b){return a+b;},0) / period;
-    for (var k = period; k < dxValues.length; k++) {
-      adx = (adx * (period - 1) + dxValues[k]) / period;
+    for (var n = period; n < dxValues.length; n++) {
+      adx = (adx * (period - 1) + dxValues[n]) / period;
     }
     return adx;
   }
@@ -224,67 +247,109 @@
     };
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  //  INSTITUTIONAL SIGNAL EVALUATION (Full Pipeline)
+  // ═══════════════════════════════════════════════════════════════
+
   function evaluateSignal(ticker, type, price, slicedCandles, dateString) {
-    // 1. Enforce Core Operational Governance Policies
+    // ─── Step 0: Governance Gates ───
     if (portfolio.isShutdown) {
       portfolio.currentState = 'SHUTDOWN';
       return;
     }
-
     if (Object.keys(portfolio.positions).length > 0) {
       portfolio.currentState = 'MANAGE';
-      return; // "One Active Position Only" Policy!
+      return;
     }
-
     if (portfolio.currentState === 'COOLDOWN') {
       if (portfolio.cooldownBarsRemaining > 0) {
         portfolio.cooldownBarsRemaining--;
-        return; // Retain cooldown block
+        return;
       } else {
         portfolio.currentState = 'WAIT';
       }
     }
-
     if (portfolio.consecutiveLosses >= 2) {
-      // Two-strike pause: Skip trading
       portfolio.currentState = 'WAIT';
       return;
     }
-
     if (portfolio.sessionTradesExecuted >= 10) {
-      // Max daily trades cap reached
       portfolio.currentState = 'WAIT';
       return;
     }
 
     portfolio.currentState = 'SCAN';
 
-    // 2. Classify Market Regime (Layer 2)
-    var regimeInfo = window.RegimeDetector ? window.RegimeDetector.detectRegime(slicedCandles) : { regime: "Range", strategyAllowed: "Mean Reversion" };
-    if (regimeInfo.regime === "Event Driven") {
-      portfolio.patienceSkips++;
-      return; // Stand aside during event volatility!
+    // ─── Step 1: Feature Engineering (Microstructure) ───
+    var featureVector = null;
+    if (window.MicrostructureEngine) {
+      try {
+        featureVector = window.MicrostructureEngine.computeFeatureVector(slicedCandles);
+      } catch (e) { featureVector = null; }
     }
 
+    // ─── Step 2: ML Signal Generation (Multi-Model Ensemble) ───
+    var tftOutput = null, dlobOutput = null, hmmOutput = null, rlOutput = null;
+    var combinedSignal = null;
+
+    if (window.SignalModels) {
+      try {
+        // Stock metadata for TFT context
+        var scanResults = window.SelectionEngine ? window.SelectionEngine.runScan('ALL', dateString) : [];
+        var stockInfo = scanResults.find(function(s) { return s.ticker === ticker; }) || { sector: 'Banking', momentum: 1.0, volumeMultiplier: 1.5 };
+
+        tftOutput = window.SignalModels.runTFT(slicedCandles, {
+          sector: stockInfo.sector,
+          marketCap: 'large',
+          eventCalendar: []
+        });
+        dlobOutput = window.SignalModels.runDLOB(slicedCandles);
+        hmmOutput = window.SignalModels.runHMM(slicedCandles);
+        rlOutput = window.SignalModels.runRLAgent(slicedCandles, null, {
+          cash: portfolio.cash,
+          portfolioValue: portfolio.portfolioValue,
+          sessionTradesExecuted: portfolio.sessionTradesExecuted
+        });
+        combinedSignal = window.SignalModels.combineSignals(tftOutput, dlobOutput, hmmOutput, rlOutput);
+      } catch (e) {
+        combinedSignal = null;
+      }
+    }
+
+    // ─── Step 3: Regime Classification ───
+    var regimeInfo = null;
+    if (hmmOutput && hmmOutput.currentRegime) {
+      // Use HMM-detected regime (more sophisticated than basic RegimeDetector)
+      var hmmRegime = hmmOutput.currentRegime;
+      if (hmmRegime === 'Trending Up' || hmmRegime === 'Trending Down') {
+        regimeInfo = { regime: 'Trending', strategyAllowed: 'Breakout', volatility: 0, drift: 0 };
+      } else if (hmmRegime === 'Mean-Reverting') {
+        regimeInfo = { regime: 'Range', strategyAllowed: 'Mean Reversion', volatility: 0, drift: 0 };
+      } else {
+        regimeInfo = { regime: 'High Volatility', strategyAllowed: 'Mean Reversion', volatility: 0, drift: 0 };
+      }
+    } else {
+      regimeInfo = window.RegimeDetector ? window.RegimeDetector.detectRegime(slicedCandles) : { regime: 'Range', strategyAllowed: 'Mean Reversion' };
+    }
+
+    if (regimeInfo.regime === 'Event Driven') {
+      portfolio.patienceSkips++;
+      return;
+    }
     if (type === 'BUY' && regimeInfo.strategyAllowed !== 'Breakout') {
-      // Strategy mismatch: Rejects trade to optimize quality > quantity
       portfolio.patienceSkips++;
-      return; 
+      return;
     }
-
     if (type === 'SELL' && regimeInfo.strategyAllowed !== 'Mean Reversion') {
-      // Mismatch
       portfolio.patienceSkips++;
       return;
     }
 
-    // Lookup stock from SelectionEngine scan to retrieve Sector, Gap % (momentum), and Volume multiplier
-    var scanResults = window.SelectionEngine ? window.SelectionEngine.runScan('ALL', dateString) : [];
-    var stockInfo = scanResults.find(function(s) { return s.ticker === ticker; }) || { sector: "Banking", momentum: 1.0, volumeMultiplier: 1.5 };
+    // Lookup stock for sector/momentum
+    var scanResults2 = window.SelectionEngine ? window.SelectionEngine.runScan('ALL', dateString) : [];
+    var stockInfo2 = scanResults2.find(function(s) { return s.ticker === ticker; }) || { sector: 'Banking', momentum: 1.0, volumeMultiplier: 1.5 };
 
-    // --- Dynamic Sub-systems Scoring ---
-
-    // Sub-system 1: Technical (0.22)
+    // ─── Step 4: Multi-Layer Decision Score (8 Sub-systems) ───
     var ema20 = calculateEma(slicedCandles, 20);
     var ema50 = calculateEma(slicedCandles, 50);
     var vwap = slicedCandles[slicedCandles.length - 1].vwap || price;
@@ -296,10 +361,8 @@
     var bbWidth = calculateBollingerWidth(slicedCandles, 20);
     var keltnerWidth = calculateKeltnerWidth(slicedCandles, 20);
 
-    // Require Trend + Momentum + Volume alignment. No single-indicator trades.
     var trendAligned = false;
     var momentumAligned = false;
-
     if (type === 'BUY') {
       trendAligned = price > ema20 && ema20 > ema50 && price > vwap;
       momentumAligned = rsi < 45 || macdInfo.bullish || stochRsi < 35;
@@ -313,26 +376,43 @@
     var avgVolume10 = last10.reduce(function(sum, c) { return sum + c.volume; }, 0) / 10;
     var volumeSurge = lastCandle.volume >= avgVolume10 * 1.5;
 
+    // Sub-system 1: Technical (0.22) — Enhanced with microstructure
     var techScore = 40;
     if (trendAligned && momentumAligned && volumeSurge) {
       techScore = 95;
     } else if (trendAligned || momentumAligned) {
       techScore = 70;
     }
-
-    // Sub-system 2: Market Context (0.20)
-    var contextScore = 35;
-    if (regimeInfo.regime === 'Trending' && regimeInfo.strategyAllowed === 'Breakout') {
-      contextScore = 95;
-    } else if (regimeInfo.regime === 'Range' && regimeInfo.strategyAllowed === 'Mean Reversion') {
-      contextScore = 95;
+    // Microstructure boost: OFI confirmation
+    if (featureVector) {
+      if (type === 'BUY' && featureVector.ofi > 0.15) techScore = Math.min(100, techScore + 5);
+      if (type === 'SELL' && featureVector.ofi < -0.15) techScore = Math.min(100, techScore + 5);
+      // Kyle's Lambda penalty (high impact = reduce score)
+      if (featureVector.kyleLambda > 0.001) techScore = Math.max(0, techScore - 3);
     }
 
-    // Sub-system 3: Order Flow Validation (0.18)
+    // Sub-system 2: Market Context (0.20) — HMM enhanced
+    var contextScore = 35;
+    if (hmmOutput && hmmOutput.confidence > 0.6) {
+      if (regimeInfo.regime === 'Trending' && regimeInfo.strategyAllowed === 'Breakout') {
+        contextScore = 95;
+      } else if (regimeInfo.regime === 'Range' && regimeInfo.strategyAllowed === 'Mean Reversion') {
+        contextScore = 95;
+      }
+    } else {
+      if (regimeInfo.regime === 'Trending' && regimeInfo.strategyAllowed === 'Breakout') {
+        contextScore = 85;
+      } else if (regimeInfo.regime === 'Range' && regimeInfo.strategyAllowed === 'Mean Reversion') {
+        contextScore = 85;
+      }
+    }
+
+    // Sub-system 3: Order Flow Validation (0.18) — Microstructure enhanced
     var lastBarUp = lastCandle.close > lastCandle.open;
-    var prevBarUp = slicedCandles[slicedCandles.length - 2] ? (slicedCandles[slicedCandles.length - 2].close > slicedCandles[slicedCandles.length - 2].open) : lastBarUp;
+    var prevBar = slicedCandles[slicedCandles.length - 2];
+    var prevBarUp = prevBar ? (prevBar.close > prevBar.open) : lastBarUp;
     var persistence = type === 'BUY' ? (lastBarUp && prevBarUp) : (!lastBarUp && !prevBarUp);
-    
+
     var cRange = lastCandle.high - lastCandle.low;
     var acceptance = type === 'BUY' ? (lastCandle.close >= lastCandle.high - cRange * 0.3) : (lastCandle.close <= lastCandle.low + cRange * 0.3);
 
@@ -342,25 +422,33 @@
     } else if (volumeSurge && (persistence || acceptance)) {
       orderFlowScore = 75;
     }
+    // Microstructure order flow enrichment
+    if (featureVector) {
+      if (Math.abs(featureVector.tradeImbalance) > 0.3 && 
+          ((type === 'BUY' && featureVector.tradeImbalance > 0) || (type === 'SELL' && featureVector.tradeImbalance < 0))) {
+        orderFlowScore = Math.min(100, orderFlowScore + 8);
+      }
+      // Amihud illiquidity penalty
+      if (featureVector.amihudRatio > 0.0001) {
+        orderFlowScore = Math.max(0, orderFlowScore - 5);
+      }
+    }
 
     // Sub-system 4: Historical Similarity (0.12)
-    var seed = ticker.split('').reduce(function(a, b) { return a + b.charCodeAt(0); }, 0) + 
+    var seed = ticker.split('').reduce(function(a, b) { return a + b.charCodeAt(0); }, 0) +
                (dateString ? dateString.split('-').reduce(function(a, b) { return a + parseInt(b); }, 0) : 100);
     var observedSessions = 100 + (seed * 13) % 350;
-    // Strict governance: if seed is divisible by 10, observed sessions is < 100 (triggers rejection)
-    if (seed % 10 === 0) {
-      observedSessions = 85; 
-    }
-    
+    if (seed % 10 === 0) observedSessions = 85;
+
     if (observedSessions < 100) {
       portfolio.patienceSkips++;
-      return; // NO TRADE: Strict governance filter (minimum 100 historical samples required)
+      return;
     }
 
-    var positiveRate = 50 + (seed % 25); // 50% to 74%
+    var positiveRate = 50 + (seed % 25);
     var histScore = Math.round(positiveRate * 1.3);
 
-    // Sub-system 5: News (0.10)
+    // Sub-system 5: News Sentiment (0.10)
     var newsScore = 60 + (seed % 8) * 5;
 
     // Sub-system 6: Volume (0.08)
@@ -368,25 +456,24 @@
 
     // Sub-system 7: Sector Strength (0.05)
     var sectorStrengths = { Banking: 85, Energy: 75, Consumer: 80, Auto: 88, Metals: 55, Pharma: 65, FMCG: 60 };
-    var sectorScore = sectorStrengths[stockInfo.sector] || 70;
+    var sectorScore = sectorStrengths[stockInfo2.sector] || 70;
 
-    // Sub-system 8: Risk Quality Filter (0.05)
+    // Sub-system 8: Risk Quality Filter (0.05) — Kelly-enhanced
     var stopDistance = atr * (portfolio.mode === 'Conservative' ? 1.0 : portfolio.mode === 'Balanced' ? 1.5 : 2.0);
-    var targetDistance = stopDistance * 2; // Strict 1:2 RR
+    var targetDistance = stopDistance * 2;
     var winProb = positiveRate / 100;
     var expectedValue = (winProb * targetDistance) - ((1 - winProb) * stopDistance);
-    
+
     var riskScore = 35;
     if (expectedValue > 0 && winProb >= 0.6) {
       riskScore = 95;
     }
-
     if (expectedValue <= 0) {
       portfolio.patienceSkips++;
-      return; // Skip negative expected value
+      return;
     }
 
-    // Calculate final weighted Score
+    // Calculate final weighted score
     var finalScore = Math.round(
       0.22 * techScore +
       0.20 * contextScore +
@@ -398,14 +485,27 @@
       0.05 * riskScore
     );
 
-    // Layer 3: Previous-Day Intelligence Bias (adds/subtracts 15 points)
-    var bias = "Neutral";
-    if (stockInfo.momentum >= 1.5 && sectorScore >= 75) {
-      bias = "Bullish";
-    } else if (stockInfo.momentum <= -1.5) {
-      bias = "Bearish";
+    // ML Meta-Learner Override: If combined signal strongly disagrees, adjust score
+    if (combinedSignal) {
+      if (type === 'BUY' && combinedSignal.signal > 0.3 && combinedSignal.confidence > 70) {
+        finalScore = Math.min(100, finalScore + Math.round(combinedSignal.confidence * 0.08));
+      } else if (type === 'SELL' && combinedSignal.signal < -0.3 && combinedSignal.confidence > 70) {
+        finalScore = Math.min(100, finalScore + Math.round(combinedSignal.confidence * 0.08));
+      } else if ((type === 'BUY' && combinedSignal.signal < -0.2) || (type === 'SELL' && combinedSignal.signal > 0.2)) {
+        finalScore = Math.max(0, finalScore - 10);
+      }
+
+      // Record model contributions
+      portfolio.modelContributions.push(combinedSignal.modelContributions || {});
     }
 
+    // Intelligence Bias Layer
+    var bias = 'Neutral';
+    if (stockInfo2.momentum >= 1.5 && sectorScore >= 75) {
+      bias = 'Bullish';
+    } else if (stockInfo2.momentum <= -1.5) {
+      bias = 'Bearish';
+    }
     if (bias === 'Bullish' && type === 'BUY') {
       finalScore = Math.min(100, finalScore + 15);
     } else if (bias === 'Bearish' && type === 'SELL') {
@@ -414,27 +514,78 @@
       finalScore = Math.max(0, finalScore - 15);
     }
 
-    // Strict Governance Entry gates:
-    // 1. Min Confidence score threshold = 85
-    // 2. Default: Stop after first completed trade. Only continue if setup is exceptionally high confidence (Score >= 90)
+    // Confidence gating
     var confidenceThreshold = portfolio.sessionTradesExecuted >= 1 ? 90 : 85;
-
     if (finalScore < confidenceThreshold) {
       portfolio.patienceSkips++;
       portfolio.currentState = 'SCAN';
-      return; // NO TRADE
+      return;
     }
 
     portfolio.currentState = 'QUALIFY';
 
-    // 4. Position Sizing & Margin Execution
-    var allowedRiskAmt = portfolio.portfolioValue * portfolio.riskPerTrade;
-    var sharesToTrade = Math.floor(allowedRiskAmt / stopDistance);
+    // ─── Step 5: Risk Engine Pre-Trade Checks ───
+    var riskApproved = true;
+    var adjustedSizeMultiplier = 1.0;
 
-    // Volatility Spike Protection: If ATR is over 2.5% of price, reduce size by 50%
+    if (window.RiskEngine) {
+      try {
+        // Volatility regime shift detection
+        if (featureVector) {
+          var volShift = window.RiskEngine.volatilityShiftDetection(
+            [featureVector.realizedVol || featureVector.garmanKlassVol || 0.02],
+            20
+          );
+          adjustedSizeMultiplier *= volShift.sizeMultiplier;
+        }
+
+        // Event filter
+        var eventCheck = window.RiskEngine.eventFilter(
+          lastCandle.time ? new Date(lastCandle.time) : new Date(),
+          []
+        );
+        adjustedSizeMultiplier *= eventCheck.sizeMultiplier;
+
+        // Drawdown circuit breaker
+        var ddCheck = window.RiskEngine.checkDrawdownBreaker(portfolio.equityCurve, 0);
+        if (ddCheck.breached) {
+          riskApproved = false;
+          portfolio.riskCheckHistory.push({ check: 'DrawdownBreaker', passed: false, detail: ddCheck });
+        }
+      } catch (e) {
+        // Continue with default sizing if risk engine fails
+      }
+    }
+
+    if (!riskApproved) {
+      portfolio.patienceSkips++;
+      portfolio.currentState = 'SCAN';
+      return;
+    }
+
+    // ─── Step 6: Position Sizing (Fractional Kelly + Volatility Scaling) ───
+    var baseRiskAmt = portfolio.portfolioValue * portfolio.riskPerTrade;
+    var sharesToTrade = Math.floor(baseRiskAmt / stopDistance);
+
+    // Kelly criterion sizing if available
+    if (window.RiskEngine) {
+      try {
+        var kellyResult = window.RiskEngine.kellySize(winProb, targetDistance / stopDistance, portfolio.portfolioValue, 0.35);
+        if (kellyResult && kellyResult.positionSize > 0) {
+          var kellyShares = Math.floor(kellyResult.positionSize / price);
+          // Use the more conservative of Kelly and ATR-based sizing
+          sharesToTrade = Math.min(sharesToTrade, kellyShares);
+        }
+      } catch (e) { /* fallback to ATR sizing */ }
+    }
+
+    // Volatility spike protection
     if (stopDistance > price * 0.025) {
       sharesToTrade = Math.floor(sharesToTrade * 0.5);
     }
+
+    // Apply risk engine size adjustments
+    sharesToTrade = Math.floor(sharesToTrade * adjustedSizeMultiplier);
 
     if (sharesToTrade <= 0) sharesToTrade = 5;
 
@@ -451,10 +602,22 @@
 
     portfolio.currentState = 'ENTER';
 
-    // Frictional Costs (Slippage + Brokerage + Taxes)
-    var slippageDrag = requiredCapital * 0.0005; // 0.05% slippage drag
+    // ─── Step 7: Execution (SOR Simulation + Frictional Costs) ───
+    var estimatedImpact = 0;
+    if (window.RiskEngine) {
+      try {
+        var sorResult = window.RiskEngine.simulateSOR(sharesToTrade, price, avgVolume10 * 75, 0.5);
+        estimatedImpact = sorResult.estimatedImpact || 0;
+      } catch (e) { /* fallback */ }
+    }
+
+    var slippageDrag = requiredCapital * 0.0005 + estimatedImpact;
     var brokerageFee = portfolio.useBrokerage ? Math.min(20, requiredCapital * 0.0003) : 0;
-    var taxes = requiredCapital * 0.00015;
+    var gstOnBrokerage = brokerageFee * 0.18;
+    var stt = requiredCapital * 0.00025;
+    var sebiTurnover = requiredCapital * 0.000001;
+    var stampDuty = requiredCapital * 0.00003;
+    var taxes = stt + sebiTurnover + stampDuty + gstOnBrokerage;
     var totalEntryDrag = slippageDrag + brokerageFee + taxes;
 
     portfolio.cash -= (marginRequired + totalEntryDrag);
@@ -464,8 +627,13 @@
 
     var sl = type === 'BUY' ? price - stopDistance : price + stopDistance;
     var tp = type === 'BUY' ? price + targetDistance : price - targetDistance;
+    var biasText = bias !== 'Neutral' ? bias + ' Bias' : 'Neutral Bias';
 
-    var biasText = bias !== 'Neutral' ? `${bias} Bias` : "Neutral Bias";
+    // Build model attribution string
+    var modelAttrStr = '';
+    if (combinedSignal) {
+      modelAttrStr = ' | ML: ' + combinedSignal.direction + ' (' + combinedSignal.confidence.toFixed(0) + '%)';
+    }
 
     portfolio.positions[ticker] = {
       ticker: ticker,
@@ -477,16 +645,32 @@
       marginUsed: marginRequired,
       requiredCapital: requiredCapital,
       entryTime: new Date(lastCandle.time).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false }),
-      reason: `Quality Score: ${finalScore} | ${biasText} | ${regimeInfo.regime}`,
+      entryBarIndex: slicedCandles.length - 1,
+      reason: 'Score: ' + finalScore + ' | ' + biasText + ' | ' + regimeInfo.regime + modelAttrStr,
       pnl: 0,
-      initialStopLoss: parseFloat(sl.toFixed(2)), // For trail monitoring
-      compositeScore: finalScore
+      initialStopLoss: parseFloat(sl.toFixed(2)),
+      compositeScore: finalScore,
+      featureVector: featureVector,
+      mlSignal: combinedSignal,
+      kellyFraction: window.RiskEngine ? adjustedSizeMultiplier : 1.0
     };
 
     portfolio.sessionTradesExecuted++;
     portfolio.currentState = 'MANAGE';
 
-    // Log action to audit ledger
+    // Store signal history for backtest analytics
+    portfolio.signalHistory.push({
+      ticker: ticker,
+      type: type,
+      score: finalScore,
+      regime: regimeInfo.regime,
+      mlDirection: combinedSignal ? combinedSignal.direction : 'N/A',
+      mlConfidence: combinedSignal ? combinedSignal.confidence : 0,
+      features: featureVector
+    });
+
+    if (featureVector) portfolio.featureVectors.push(featureVector);
+
     if (window.AuditEngine) {
       window.AuditEngine.logAction({
         time: portfolio.positions[ticker].entryTime,
@@ -500,8 +684,11 @@
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  //  POSITION MANAGEMENT
+  // ═══════════════════════════════════════════════════════════════
+
   function evaluatePositions(slicedCandlesMap) {
-    // Check Shutdown status
     var lossThreshold = portfolio.startingCapital * (1 + portfolio.dailyLossCutoff);
     if (portfolio.portfolioValue <= lossThreshold) {
       portfolio.isShutdown = true;
@@ -518,20 +705,15 @@
 
       var lastCandle = candles[candles.length - 1];
       var curPrice = lastCandle.close;
-
-      // 1. Calculate realized net P&L
-      var unrealizedPnl = pos.type === 'BUY' 
-        ? (curPrice - pos.entryPrice) * pos.shares 
+      var unrealizedPnl = pos.type === 'BUY'
+        ? (curPrice - pos.entryPrice) * pos.shares
         : (pos.entryPrice - curPrice) * pos.shares;
-      
       pos.pnl = unrealizedPnl;
 
-      // 2. Dynamic Trailing Profit Exit (Phase 16 Smart Exits)
-      // Lock profit by raising stops once price moves significantly in our favor
+      // Dynamic trailing stop
       if (pos.type === 'BUY') {
         var priceRise = curPrice - pos.entryPrice;
         if (priceRise > (pos.takeProfit - pos.entryPrice) * 0.5) {
-          // Move stop to break-even (entry price) to secure capital
           pos.stopLoss = Math.max(pos.stopLoss, pos.entryPrice);
         }
       } else {
@@ -541,11 +723,10 @@
         }
       }
 
-      // 3. Monitor protective stop loss and target profit exits
       var hitStop = pos.type === 'BUY' ? lastCandle.low <= pos.stopLoss : lastCandle.high >= pos.stopLoss;
       var hitTarget = pos.type === 'BUY' ? lastCandle.high >= pos.takeProfit : lastCandle.low <= pos.takeProfit;
 
-      // Soft Exit: Momentum Loss (e.g. 3 consecutive opposite bars)
+      // Momentum loss soft exit
       var momentumLoss = false;
       if (candles.length >= 3) {
         var last3 = candles.slice(-3);
@@ -559,63 +740,89 @@
       var nowStr = new Date(lastCandle.time).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
 
       if (hitStop) {
-        closePosition(ticker, pos.stopLoss, "Stopped Out 🛑", nowStr, true);
+        closePosition(ticker, pos.stopLoss, 'Stopped Out 🛑', nowStr, true, candles.length - 1);
       } else if (hitTarget) {
-        closePosition(ticker, pos.takeProfit, "Target Hit 🎯", nowStr, false);
+        closePosition(ticker, pos.takeProfit, 'Target Hit 🎯', nowStr, false, candles.length - 1);
       } else if (momentumLoss) {
-        // Soft Exit
-        closePosition(ticker, curPrice, "Soft Exit (Momentum Loss) 💨", nowStr, false);
+        closePosition(ticker, curPrice, 'Soft Exit (Momentum Loss) 💨', nowStr, false, candles.length - 1);
       }
     }
 
+    // Track equity curve
     recalculatePortfolioValue(slicedCandlesMap);
+    portfolio.equityCurve.push(portfolio.portfolioValue);
+
+    // Track bar returns
+    var barReturn = (portfolio.portfolioValue - portfolio.lastPortfolioValue) / portfolio.lastPortfolioValue;
+    portfolio.barReturns.push(barReturn);
+    portfolio.lastPortfolioValue = portfolio.portfolioValue;
   }
 
-  function closePosition(ticker, exitPrice, outcome, timeStr, isLoss) {
+  function closePosition(ticker, exitPrice, outcome, timeStr, isLoss, exitBarIndex) {
     portfolio.currentState = 'EXIT';
     var pos = portfolio.positions[ticker];
     if (!pos) return;
 
-    // Frictional costs calculations (Order Exit)
-    var slippageDrag = (pos.shares * exitPrice) * 0.0005;
-    var brokerageFee = portfolio.useBrokerage ? Math.min(20, (pos.shares * exitPrice) * 0.0003) : 0;
-    var taxes = (pos.shares * exitPrice) * 0.00015;
+    // Exit frictional costs
+    var exitValue = pos.shares * exitPrice;
+    var slippageDrag = exitValue * 0.0005;
+    var brokerageFee = portfolio.useBrokerage ? Math.min(20, exitValue * 0.0003) : 0;
+    var gstOnBrokerage = brokerageFee * 0.18;
+    var stt = exitValue * 0.00025;
+    var sebiTurnover = exitValue * 0.000001;
+    var stampDuty = exitValue * 0.00003;
+    var taxes = stt + sebiTurnover + stampDuty + gstOnBrokerage;
     var totalExitDrag = slippageDrag + brokerageFee + taxes;
 
     portfolio.slippageFees += slippageDrag;
     portfolio.brokerageFees += brokerageFee;
     portfolio.taxFees += taxes;
 
-    var finalPnl = pos.type === 'BUY' 
-      ? (exitPrice - pos.entryPrice) * pos.shares 
+    var finalPnl = pos.type === 'BUY'
+      ? (exitPrice - pos.entryPrice) * pos.shares
       : (pos.entryPrice - exitPrice) * pos.shares;
-    
-    var netPnl = finalPnl - (pos.entryPrice * pos.shares * 0.0005 + totalExitDrag);
+
+    var totalDrag = (pos.entryPrice * pos.shares * 0.0005 + totalExitDrag);
+    var netPnl = finalPnl - totalDrag;
 
     portfolio.cash += (pos.marginUsed + finalPnl - totalExitDrag);
 
-    // Track consecutive losses
     if (isLoss || netPnl < 0) {
       portfolio.consecutiveLosses++;
     } else {
-      portfolio.consecutiveLosses = 0; // Reset
+      portfolio.consecutiveLosses = 0;
     }
+
+    // Implementation shortfall analysis
+    var isAnalysis = null;
+    if (window.RiskEngine) {
+      try {
+        var vwapBenchmark = pos.entryPrice;
+        isAnalysis = window.RiskEngine.implementationShortfall(
+          pos.entryPrice, exitPrice, vwapBenchmark, pos.shares, pos.type === 'BUY' ? 1 : -1
+        );
+      } catch (e) { /* skip */ }
+    }
+
+    var holdBars = exitBarIndex !== undefined ? (exitBarIndex - (pos.entryBarIndex || 0)) : 0;
 
     portfolio.closedTrades.push(Object.assign({}, pos, {
       exitPrice: exitPrice,
       exitTime: timeStr,
       pnl: finalPnl,
       netPnl: netPnl,
-      outcome: outcome
+      outcome: outcome,
+      holdBars: holdBars,
+      implementationShortfall: isAnalysis,
+      featureVector: pos.featureVector,
+      mlSignal: pos.mlSignal
     }));
 
     delete portfolio.positions[ticker];
 
-    // Trigger Cooldown state (10 mins = 2 bars)
     portfolio.currentState = 'COOLDOWN';
     portfolio.cooldownBarsRemaining = 2;
 
-    // Log to audit engine
     if (window.AuditEngine) {
       window.AuditEngine.logAction({
         time: timeStr,
@@ -624,7 +831,7 @@
         price: exitPrice,
         qty: pos.shares,
         sl: pos.stopLoss,
-        reason: outcome + ` (Net PnL: ₹${netPnl.toFixed(0)}, Score: ${pos.compositeScore})`
+        reason: outcome + ' (Net PnL: \u20B9' + netPnl.toFixed(0) + ', Score: ' + pos.compositeScore + ', Hold: ' + holdBars + ' bars)'
       });
     }
   }
@@ -635,7 +842,8 @@
       var last = candles ? candles[candles.length - 1] : null;
       var exitPrice = last ? last.close : portfolio.positions[ticker].entryPrice;
       var timeStr = last ? new Date(last.time).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false }) : '15:30';
-      closePosition(ticker, exitPrice, "Time Exit (EOD) ⚖️", timeStr, false);
+      var barIdx = candles ? candles.length - 1 : 0;
+      closePosition(ticker, exitPrice, 'Time Exit (EOD) \u2696\uFE0F', timeStr, false, barIdx);
     }
     recalculatePortfolioValue(slicedCandlesMap);
   }
@@ -643,15 +851,86 @@
   function recalculatePortfolioValue(slicedCandlesMap) {
     var unrealizedSum = 0;
     var marginSum = 0;
-
     for (var ticker in portfolio.positions) {
       var pos = portfolio.positions[ticker];
       unrealizedSum += pos.pnl;
       marginSum += pos.marginUsed;
     }
-
     portfolio.portfolioValue = portfolio.cash + marginSum + unrealizedSum;
   }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  BACKTESTING STATISTICS (Post-Simulation)
+  // ═══════════════════════════════════════════════════════════════
+
+  function computeAdvancedStats() {
+    var stats = {};
+
+    if (window.BacktestStats && portfolio.barReturns.length > 5) {
+      try {
+        // Core ratios
+        stats.ratios = window.BacktestStats.sharpeRatio(portfolio.barReturns, 0);
+
+        // Monte Carlo significance test
+        stats.monteCarlo = window.BacktestStats.monteCarloTest(portfolio.barReturns, 500);
+
+        // Walk-forward validation
+        if (portfolio.barReturns.length > 20) {
+          stats.walkForward = window.BacktestStats.walkForwardTest(portfolio.barReturns, 15, 5);
+        }
+
+        // Deflated Sharpe Ratio
+        if (stats.ratios) {
+          var skew = 0, kurt = 3;
+          var mean = portfolio.barReturns.reduce(function(a,b){return a+b;}, 0) / portfolio.barReturns.length;
+          var std = Math.sqrt(portfolio.barReturns.reduce(function(a,b){return a + Math.pow(b - mean, 2);}, 0) / portfolio.barReturns.length);
+          if (std > 0) {
+            skew = portfolio.barReturns.reduce(function(a,b){return a + Math.pow((b - mean)/std, 3);}, 0) / portfolio.barReturns.length;
+            kurt = portfolio.barReturns.reduce(function(a,b){return a + Math.pow((b - mean)/std, 4);}, 0) / portfolio.barReturns.length;
+          }
+          stats.deflatedSharpe = window.BacktestStats.deflatedSharpeRatio(
+            stats.ratios.sharpe, 1, portfolio.barReturns.length, skew, kurt
+          );
+        }
+
+        // Equity curve analytics
+        stats.equityCurve = window.BacktestStats.equityCurveAnalytics(portfolio.equityCurve);
+
+        // Feature importance (SHAP-like)
+        if (portfolio.featureVectors.length > 2 && portfolio.closedTrades.length > 2) {
+          stats.featureImportance = window.BacktestStats.featureImportance(portfolio.closedTrades, portfolio.featureVectors);
+        }
+
+        // Performance attribution
+        if (portfolio.closedTrades.length > 0) {
+          stats.attribution = window.BacktestStats.performanceAttribution(portfolio.closedTrades);
+        }
+
+        // Transaction cost analysis
+        stats.costAnalysis = window.BacktestStats.transactionCostModel(portfolio.closedTrades, {});
+
+        // Strategy health score
+        stats.healthScore = window.BacktestStats.strategyHealthScore({
+          sharpe: stats.ratios ? stats.ratios.sharpe : 0,
+          sortino: stats.ratios ? stats.ratios.sortino : 0,
+          maxDrawdown: stats.ratios ? stats.ratios.maxDrawdown : 0,
+          dsrSignificant: stats.deflatedSharpe ? stats.deflatedSharpe.isSignificant : false,
+          walkForwardDeg: stats.walkForward ? stats.walkForward.degradationRatio : 1,
+          profitFactor: stats.equityCurve ? stats.equityCurve.profitFactor : 1,
+          monteCarloP: stats.monteCarlo ? stats.monteCarlo.pValue : 1,
+          featureDriftCount: stats.featureImportance ? stats.featureImportance.driftWarnings.length : 0
+        });
+      } catch (e) {
+        stats.error = e.message || 'Stats computation error';
+      }
+    }
+
+    return stats;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  STRESS TESTING
+  // ═══════════════════════════════════════════════════════════════
 
   function runSingleDayStress(tickers, dateString, startingCapital, riskPct, mode, useBrokerage, allowShort, useMargin) {
     var mockPf = {
@@ -669,19 +948,14 @@
     var candlesMap = {};
     tickers.forEach(function(t) {
       if (window.ReplayEngine && typeof window.ReplayEngine.generateReplayIntradayCandles === 'function') {
-        // Safe fallback call
         try {
           candlesMap[t] = window.ReplayEngine.generateReplayIntradayCandles(t, dateString);
-        } catch (e) {
-          candlesMap[t] = [];
-        }
+        } catch (e) { candlesMap[t] = []; }
       }
-      
       if (!candlesMap[t] || candlesMap[t].length === 0) {
-        // Fallback generator in case ReplayEngine isn't loaded (lookahead protected)
         var candles = [];
         var curPrice = 1000;
-        var start = new Date(dateString || "2026-05-15");
+        var start = new Date(dateString || '2026-05-15');
         start.setHours(9, 15, 0, 0);
         for (var i = 0; i < 75; i++) {
           var time = new Date(start.getTime() + i * 5 * 60 * 1000);
@@ -718,50 +992,44 @@
 
       if (Object.keys(mockPf.positions).length === 0 && mockPf.consecutiveLosses < 2 && mockPf.sessionTradesExecuted < 10) {
         for (var i = 0; i < tickers.length; i++) {
-          var ticker = tickers[i];
-          var stockSlice = slices[ticker];
+          var tickerKey = tickers[i];
+          var stockSlice = slices[tickerKey];
           if (stockSlice.length < 2) continue;
-          var lastCandle = stockSlice[stockSlice.length - 1];
-          var rsi = calculateWilderRsi(stockSlice);
-          var type = rsi < 32 ? 'BUY' : rsi > 68 ? 'SELL' : null;
+          var lastCdl = stockSlice[stockSlice.length - 1];
+          var rsiVal = calculateWilderRsi(stockSlice);
+          var sigType = rsiVal < 32 ? 'BUY' : rsiVal > 68 ? 'SELL' : null;
 
-          if (type) {
-            var regimeInfo = window.RegimeDetector ? window.RegimeDetector.detectRegime(stockSlice) : { regime: "Range", strategyAllowed: "Mean Reversion" };
-            if (regimeInfo.regime !== "Event Driven" && 
-                ((type === 'BUY' && regimeInfo.strategyAllowed === 'Breakout') || 
-                 (type === 'SELL' && regimeInfo.strategyAllowed === 'Mean Reversion'))) {
-              
-              var atr = calculateAtr(stockSlice, 14);
-              var stopDistance = atr * (mode === 'Conservative' ? 1.0 : mode === 'Balanced' ? 1.5 : 2.0);
-              var targetDistance = stopDistance * 2;
-              var shares = Math.floor((mockPf.portfolioValue * riskPct) / stopDistance);
-              if (shares <= 0) shares = 5;
+          if (sigType) {
+            var regInfo = window.RegimeDetector ? window.RegimeDetector.detectRegime(stockSlice) : { regime: 'Range', strategyAllowed: 'Mean Reversion' };
+            if (regInfo.regime !== 'Event Driven' &&
+                ((sigType === 'BUY' && regInfo.strategyAllowed === 'Breakout') ||
+                 (sigType === 'SELL' && regInfo.strategyAllowed === 'Mean Reversion'))) {
 
-              var reqCapital = shares * lastCandle.close;
-              var margin = useMargin ? reqCapital / 5 : reqCapital;
+              var atrVal = calculateAtr(stockSlice, 14);
+              var stopDist = atrVal * (mode === 'Conservative' ? 1.0 : mode === 'Balanced' ? 1.5 : 2.0);
+              var targetDist = stopDist * 2;
+              var numShares = Math.floor((mockPf.portfolioValue * riskPct) / stopDist);
+              if (numShares <= 0) numShares = 5;
+
+              var reqCap = numShares * lastCdl.close;
+              var margin = useMargin ? reqCap / 5 : reqCap;
               if (margin > mockPf.cash) {
-                shares = Math.floor((mockPf.cash * (useMargin ? 5 : 1)) / lastCandle.close);
-                reqCapital = shares * lastCandle.close;
-                margin = useMargin ? reqCapital / 5 : reqCapital;
+                numShares = Math.floor((mockPf.cash * (useMargin ? 5 : 1)) / lastCdl.close);
+                reqCap = numShares * lastCdl.close;
+                margin = useMargin ? reqCap / 5 : reqCap;
               }
 
-              if (shares > 0) {
-                var sl = type === 'BUY' ? lastCandle.close - stopDistance : lastCandle.close + stopDistance;
-                var tp = type === 'BUY' ? lastCandle.close + targetDistance : lastCandle.close - targetDistance;
-
-                mockPf.positions[ticker] = {
-                  ticker: ticker,
-                  type: type,
-                  shares: shares,
-                  entryPrice: lastCandle.close,
-                  stopLoss: sl,
-                  takeProfit: tp,
-                  marginUsed: margin,
-                  pnl: 0
+              if (numShares > 0) {
+                var stopL = sigType === 'BUY' ? lastCdl.close - stopDist : lastCdl.close + stopDist;
+                var takeP = sigType === 'BUY' ? lastCdl.close + targetDist : lastCdl.close - targetDist;
+                mockPf.positions[tickerKey] = {
+                  ticker: tickerKey, type: sigType, shares: numShares,
+                  entryPrice: lastCdl.close, stopLoss: stopL, takeProfit: takeP,
+                  marginUsed: margin, pnl: 0
                 };
                 mockPf.sessionTradesExecuted++;
                 mockPf.cash -= margin;
-                break; // Sequential policy: only one trade opened
+                break;
               }
             }
           }
@@ -769,54 +1037,50 @@
       }
 
       for (var pTicker in mockPf.positions) {
-        var pos = mockPf.positions[pTicker];
+        var posn = mockPf.positions[pTicker];
         var cList = slices[pTicker];
-        var curCandle = cList[cList.length - 1];
-        var curPrice = curCandle.close;
+        var curCdl = cList[cList.length - 1];
+        var curPrc = curCdl.close;
 
-        pos.pnl = pos.type === 'BUY' ? (curPrice - pos.entryPrice) * pos.shares : (pos.entryPrice - curPrice) * pos.shares;
+        posn.pnl = posn.type === 'BUY' ? (curPrc - posn.entryPrice) * posn.shares : (posn.entryPrice - curPrc) * posn.shares;
 
-        if (pos.type === 'BUY') {
-          if (curPrice - pos.entryPrice > (pos.takeProfit - pos.entryPrice) * 0.5) {
-            pos.stopLoss = Math.max(pos.stopLoss, pos.entryPrice);
+        if (posn.type === 'BUY') {
+          if (curPrc - posn.entryPrice > (posn.takeProfit - posn.entryPrice) * 0.5) {
+            posn.stopLoss = Math.max(posn.stopLoss, posn.entryPrice);
           }
         } else {
-          if (pos.entryPrice - curPrice > (pos.entryPrice - pos.takeProfit) * 0.5) {
-            pos.stopLoss = Math.min(pos.stopLoss, pos.entryPrice);
+          if (posn.entryPrice - curPrc > (posn.entryPrice - posn.takeProfit) * 0.5) {
+            posn.stopLoss = Math.min(posn.stopLoss, posn.entryPrice);
           }
         }
 
-        var hitStop = pos.type === 'BUY' ? curCandle.low <= pos.stopLoss : curCandle.high >= pos.stopLoss;
-        var hitTarget = pos.type === 'BUY' ? curCandle.high >= pos.takeProfit : curCandle.low <= pos.takeProfit;
+        var hitStp = posn.type === 'BUY' ? curCdl.low <= posn.stopLoss : curCdl.high >= posn.stopLoss;
+        var hitTgt = posn.type === 'BUY' ? curCdl.high >= posn.takeProfit : curCdl.low <= posn.takeProfit;
 
-        if (hitStop || hitTarget) {
-          var exitPrice = hitStop ? pos.stopLoss : pos.takeProfit;
-          var pnlVal = pos.type === 'BUY' ? (exitPrice - pos.entryPrice) * pos.shares : (pos.entryPrice - exitPrice) * pos.shares;
-          mockPf.cash += pos.marginUsed + pnlVal;
-          mockPf.closedTrades.push({ netPnl: pnlVal });
+        if (hitStp || hitTgt) {
+          var exitP = hitStp ? posn.stopLoss : posn.takeProfit;
+          var pnlV = posn.type === 'BUY' ? (exitP - posn.entryPrice) * posn.shares : (posn.entryPrice - exitP) * posn.shares;
+          mockPf.cash += posn.marginUsed + pnlV;
+          mockPf.closedTrades.push({ netPnl: pnlV });
           delete mockPf.positions[pTicker];
-          if (pnlVal < 0) mockPf.consecutiveLosses++;
+          if (pnlV < 0) mockPf.consecutiveLosses++;
           else mockPf.consecutiveLosses = 0;
         }
       }
 
-      var unrealized = 0;
-      var margins = 0;
-      for (var pKey in mockPf.positions) {
-        unrealized += mockPf.positions[pKey].pnl;
-        margins += mockPf.positions[pKey].marginUsed;
-      }
-      mockPf.portfolioValue = mockPf.cash + margins + unrealized;
+      var unr = 0, mrg = 0;
+      for (var pK in mockPf.positions) { unr += mockPf.positions[pK].pnl; mrg += mockPf.positions[pK].marginUsed; }
+      mockPf.portfolioValue = mockPf.cash + mrg + unr;
     }
 
-    for (var pfTicker in mockPf.positions) {
-      var activePos = mockPf.positions[pfTicker];
-      var lastC = candlesMap[pfTicker] ? candlesMap[pfTicker][candlesMap[pfTicker].length - 1] : null;
-      var exitP = lastC ? lastC.close : activePos.entryPrice;
-      var pnlVal = activePos.type === 'BUY' ? (exitP - activePos.entryPrice) * activePos.shares : (activePos.entryPrice - exitP) * activePos.shares;
-      mockPf.cash += activePos.marginUsed + pnlVal;
+    for (var pfTk in mockPf.positions) {
+      var activeP = mockPf.positions[pfTk];
+      var lastCandl = candlesMap[pfTk] ? candlesMap[pfTk][candlesMap[pfTk].length - 1] : null;
+      var exitPr = lastCandl ? lastCandl.close : activeP.entryPrice;
+      var pnlVal = activeP.type === 'BUY' ? (exitPr - activeP.entryPrice) * activeP.shares : (activeP.entryPrice - exitPr) * activeP.shares;
+      mockPf.cash += activeP.marginUsed + pnlVal;
       mockPf.closedTrades.push({ netPnl: pnlVal });
-      delete mockPf.positions[pfTicker];
+      delete mockPf.positions[pfTk];
     }
     mockPf.portfolioValue = mockPf.cash;
 
@@ -866,12 +1130,17 @@
     };
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  //  PUBLIC API
+  // ═══════════════════════════════════════════════════════════════
+
   window.PortfolioSimulator = {
     init: initPortfolio,
     processSignal: evaluateSignal,
     evaluatePositions: evaluatePositions,
     forceCloseAll: forceCloseAll,
     getPortfolio: function () { return portfolio; },
-    runStressTest: runStressTest
+    runStressTest: runStressTest,
+    computeAdvancedStats: computeAdvancedStats
   };
 })();
